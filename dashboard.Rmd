@@ -1,0 +1,1242 @@
+---
+title: "Team Tesla — EV Market Intelligence"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    horizontal_layout: fill
+    css: styles.css
+    theme:
+      version: 5
+      navbar-bg: "#3ADAC6"
+      base_font:
+        google: Prompt
+      heading_font:
+        google: Sen
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(plotly)
+library(DT)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(RColorBrewer)
+library(reshape2)
+library(cluster)
+library(factoextra)
+library(rpart)
+library(randomForest)
+thematic::thematic_rmd(font = "auto")
+
+df <- read.csv("ElectricCarData_Clean.csv", stringsAsFactors = FALSE)
+df$Brand <- trimws(df$Brand)
+df$Model <- trimws(df$Model)
+df$FastCharge_KmH[df$FastCharge_KmH == "-"] <- NA
+df$FastCharge_KmH <- as.numeric(df$FastCharge_KmH)
+
+# Derived metrics
+df$ValueIndex <- round(df$Range_Km / (df$PriceEuro / 1000), 2)        # km per €1000
+df$PerfValue  <- round(df$TopSpeed_KmH / (df$PriceEuro / 1000), 2)    # km/h per €1000
+df$CostPerKm  <- round(df$PriceEuro / df$Range_Km, 2)                 # € per km of range
+df$FullName   <- paste(df$Brand, df$Model)
+
+brand_summary <- df %>%
+  group_by(Brand) %>%
+  summarise(
+    Models      = n(),
+    AvgPrice    = mean(PriceEuro),
+    AvgRange    = mean(Range_Km),
+    AvgSpeed    = mean(TopSpeed_KmH),
+    AvgAccel    = mean(AccelSec),
+    AvgEfficiency = mean(Efficiency_WhKm),
+    AvgValue    = mean(ValueIndex),
+    .groups = "drop"
+  )
+
+# --- Market Intelligence: Fair Price Model ---
+df$FastCharge_KmH_imp <- ifelse(is.na(df$FastCharge_KmH),
+                                 median(df$FastCharge_KmH, na.rm = TRUE),
+                                 df$FastCharge_KmH)
+fair_model <- lm(PriceEuro ~ Range_Km + TopSpeed_KmH + AccelSec +
+                  Efficiency_WhKm + FastCharge_KmH_imp + Seats + PowerTrain,
+                 data = df)
+df$FairPrice     <- round(predict(fair_model))
+df$PriceDelta    <- df$PriceEuro - df$FairPrice
+df$PriceDeltaPct <- round(df$PriceDelta / df$FairPrice * 100, 1)
+
+# --- TCO (5-year, 15k km/yr, €0.25/kWh) ---
+df$ElecCost5yr <- round(df$Efficiency_WhKm * 15000 * 5 / 1000 * 0.25)
+df$TCO5yr      <- df$PriceEuro + df$ElecCost5yr
+
+# --- Market Gap bins ---
+df$PriceTier <- cut(df$PriceEuro,
+                     breaks = c(0, 30000, 50000, 80000, Inf),
+                     labels = c("Budget\n(<\u20AC30k)", "Mid\n(\u20AC30-50k)",
+                                "Premium\n(\u20AC50-80k)", "Luxury\n(>\u20AC80k)"))
+df$RangeTier <- cut(df$Range_Km,
+                     breaks = c(0, 200, 350, 500, Inf),
+                     labels = c("City\n(<200km)", "Commuter\n(200-350km)",
+                                "Touring\n(350-500km)", "Long Range\n(500+km)"))
+
+# --- TOPSIS from scratch ---
+topsis <- function(mat, weights, impacts) {
+  norm_mat <- apply(mat, 2, function(x) x / sqrt(sum(x^2, na.rm = TRUE)))
+  weighted <- sweep(norm_mat, 2, weights, "*")
+  ideal_best <- sapply(seq_len(ncol(weighted)), function(j)
+    if (impacts[j] == "+") max(weighted[, j]) else min(weighted[, j]))
+  ideal_worst <- sapply(seq_len(ncol(weighted)), function(j)
+    if (impacts[j] == "-") max(weighted[, j]) else min(weighted[, j]))
+  d_plus  <- sqrt(rowSums(sweep(weighted, 2, ideal_best)^2))
+  d_minus <- sqrt(rowSums(sweep(weighted, 2, ideal_worst)^2))
+  d_minus / (d_plus + d_minus)
+}
+
+# Prepare TOPSIS input (complete cases for FastCharge)
+topsis_df <- df %>% filter(!is.na(FastCharge_KmH))
+topsis_mat <- as.matrix(topsis_df[, c("Range_Km", "PriceEuro", "Efficiency_WhKm",
+                                       "TopSpeed_KmH", "AccelSec", "FastCharge_KmH")])
+# impacts: Range+, Price-, Efficiency-, Speed+, Accel-, FastCharge+
+topsis_impacts <- c("+", "-", "-", "+", "-", "+")
+
+profiles <- list(
+  "Budget Commuter"        = c(0.20, 0.40, 0.25, 0.05, 0.05, 0.05),
+  "Road Trip Ready"        = c(0.30, 0.10, 0.15, 0.05, 0.05, 0.35),
+  "Performance Enthusiast" = c(0.10, 0.10, 0.05, 0.30, 0.35, 0.10),
+  "Green Minimalist"       = c(0.20, 0.25, 0.40, 0.05, 0.05, 0.05)
+)
+
+topsis_results <- lapply(names(profiles), function(pname) {
+  scores <- topsis(topsis_mat, profiles[[pname]], topsis_impacts)
+  top5 <- order(scores, decreasing = TRUE)[1:5]
+  data.frame(
+    Profile = pname,
+    Rank    = 1:5,
+    Car     = topsis_df$FullName[top5],
+    Score   = round(scores[top5], 3),
+    Price   = topsis_df$PriceEuro[top5],
+    Range   = topsis_df$Range_Km[top5],
+    stringsAsFactors = FALSE
+  )
+})
+topsis_all <- do.call(rbind, topsis_results)
+
+# --- ML Lab: Train/Test Split (80/20) ---
+set.seed(42)
+train_idx <- sample(seq_len(nrow(df)), size = floor(0.8 * nrow(df)))
+train_df <- df[train_idx, ]
+test_df  <- df[-train_idx, ]
+
+# --- Decision Tree (Segment Classification) ---
+dt_model <- rpart(Segment ~ PriceEuro + Range_Km + TopSpeed_KmH + AccelSec +
+                    Efficiency_WhKm + Seats,
+                  data = train_df, method = "class",
+                  control = rpart.control(cp = 0.01, minsplit = 5))
+
+# Predictions on train and test
+train_df$PredSegment <- predict(dt_model, train_df, type = "class")
+test_df$PredSegment  <- predict(dt_model, test_df, type = "class")
+dt_train_acc <- round(mean(train_df$PredSegment == train_df$Segment) * 100, 1)
+dt_test_acc  <- round(mean(test_df$PredSegment == test_df$Segment) * 100, 1)
+
+# Confusion matrix (test set)
+dt_conf <- table(Predicted = test_df$PredSegment, Actual = test_df$Segment)
+# Ensure all levels present in confusion matrix
+all_segs <- sort(unique(df$Segment))
+dt_conf_full <- matrix(0, nrow = length(all_segs), ncol = length(all_segs),
+                       dimnames = list(Predicted = all_segs, Actual = all_segs))
+for (p in rownames(dt_conf)) for (a in colnames(dt_conf)) dt_conf_full[p, a] <- dt_conf[p, a]
+
+# Per-class precision, recall, F1
+dt_metrics <- data.frame(Segment = all_segs, stringsAsFactors = FALSE)
+dt_metrics$Precision <- sapply(all_segs, function(s) {
+  tp <- dt_conf_full[s, s]; fp <- sum(dt_conf_full[s, ]) - tp
+  if (tp + fp == 0) NA else round(tp / (tp + fp), 3)
+})
+dt_metrics$Recall <- sapply(all_segs, function(s) {
+  tp <- dt_conf_full[s, s]; fn <- sum(dt_conf_full[, s]) - tp
+  if (tp + fn == 0) NA else round(tp / (tp + fn), 3)
+})
+dt_metrics$F1 <- round(2 * dt_metrics$Precision * dt_metrics$Recall /
+                         (dt_metrics$Precision + dt_metrics$Recall), 3)
+dt_metrics$F1[is.nan(dt_metrics$F1)] <- NA
+
+# Baseline: majority class
+majority_class <- names(sort(table(train_df$Segment), decreasing = TRUE))[1]
+dt_baseline_acc <- round(mean(test_df$Segment == majority_class) * 100, 1)
+
+# Extract top split rules from tree
+dt_rules <- data.frame(
+  Rule = labels(dt_model, minlength = 0)[-1],
+  stringsAsFactors = FALSE
+)
+
+# --- Random Forest (Price Prediction) ---
+rf_model <- randomForest(PriceEuro ~ Range_Km + TopSpeed_KmH + AccelSec +
+                           Efficiency_WhKm + FastCharge_KmH_imp + Seats,
+                         data = train_df, ntree = 500, importance = TRUE)
+
+# Predictions
+train_df$RF_Price <- predict(rf_model, train_df)
+test_df$RF_Price  <- predict(rf_model, test_df)
+
+# Also get LM predictions on test
+test_df$LM_Price <- round(predict(fair_model, test_df))
+train_df$LM_Price <- round(predict(fair_model, train_df))
+
+# Test set metrics
+rf_test_r2   <- round(1 - sum((test_df$PriceEuro - test_df$RF_Price)^2) /
+                         sum((test_df$PriceEuro - mean(train_df$PriceEuro))^2), 3)
+rf_test_rmse <- round(sqrt(mean((test_df$PriceEuro - test_df$RF_Price)^2)))
+rf_test_mae  <- round(mean(abs(test_df$PriceEuro - test_df$RF_Price)))
+
+lm_test_r2   <- round(1 - sum((test_df$PriceEuro - test_df$LM_Price)^2) /
+                         sum((test_df$PriceEuro - mean(train_df$PriceEuro))^2), 3)
+lm_test_rmse <- round(sqrt(mean((test_df$PriceEuro - test_df$LM_Price)^2)))
+lm_test_mae  <- round(mean(abs(test_df$PriceEuro - test_df$LM_Price)))
+
+# Baseline: always predict mean price
+baseline_rmse <- round(sqrt(mean((test_df$PriceEuro - mean(train_df$PriceEuro))^2)))
+baseline_mae  <- round(mean(abs(test_df$PriceEuro - mean(train_df$PriceEuro))))
+
+# Train set metrics for comparison
+rf_train_r2 <- round(1 - sum((train_df$PriceEuro - train_df$RF_Price)^2) /
+                        sum((train_df$PriceEuro - mean(train_df$PriceEuro))^2), 3)
+lm_train_r2 <- round(summary(fair_model)$r.squared, 3)
+
+# Variable importance
+rf_imp <- data.frame(
+  Feature = rownames(importance(rf_model)),
+  Importance = importance(rf_model)[, "%IncMSE"]
+) %>% arrange(desc(Importance))
+
+# Merge predictions back to full df for visualization
+df$RF_Price <- predict(rf_model, df)
+df$FairPrice <- round(predict(fair_model, df))
+
+# --- Outlier Detection (IQR method) ---
+outlier_cols <- c("PriceEuro", "Range_Km", "TopSpeed_KmH", "AccelSec", "Efficiency_WhKm")
+outlier_summary <- lapply(outlier_cols, function(col) {
+  vals <- df[[col]]
+  q1 <- quantile(vals, 0.25, na.rm = TRUE)
+  q3 <- quantile(vals, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+  outliers <- which(vals < lower | vals > upper)
+  data.frame(Feature = col, Q1 = round(q1), Q3 = round(q3), IQR = round(iqr),
+             Lower = round(lower), Upper = round(upper),
+             Outliers = length(outliers), stringsAsFactors = FALSE)
+})
+outlier_df <- do.call(rbind, outlier_summary)
+```
+
+Overview {data-icon="fa-table"}
+===
+Row
+-----------------------------------------------------------------------
+
+### Cars Analysed
+```{r}
+valueBox(nrow(df), icon = "fa-car")
+```
+
+### Total Market Value
+```{r}
+valueBox(paste0("€", format(sum(df$PriceEuro), big.mark = ",")), icon = "fa-money", color="#85bb65")
+```
+
+### Brands
+```{r}
+valueBox(length(unique(df$Brand)), icon = "fa-tag")
+```
+
+### Models
+```{r}
+valueBox(length(unique(df$Model)), icon = "fa-cubes")
+```
+
+### Mean Price
+```{r}
+valueBox(paste0("€", format(trunc(mean(df$PriceEuro)), big.mark = ",")), icon = "fa-dollar", color = "green")
+```
+
+### Mean Range
+```{r}
+valueBox(paste0(trunc(mean(df$Range_Km)), " km"), icon = "fas fa-car-battery", color="#f8c294")
+```
+
+Column {data-width=1200}
+-----------------------------------------------------------------------
+### Full Dataset Explorer (sortable & searchable)
+```{r}
+DT::datatable(
+  df %>% select(Brand, Model, PriceEuro, Range_Km, TopSpeed_KmH, AccelSec,
+                Efficiency_WhKm, FastCharge_KmH, PowerTrain, Segment, Seats,
+                ValueIndex, CostPerKm),
+  colnames = c("Brand","Model","Price (€)","Range (km)","Top Speed","0-100 (s)",
+               "Efficiency (Wh/km)","Fast Charge (km/h)","Drivetrain","Segment",
+               "Seats","Value Index","Cost/km (€)"),
+  options = list(pageLength = 15, scrollX = TRUE),
+  filter = "top",
+  fillContainer = FALSE
+) %>% DT::formatCurrency("PriceEuro", currency = "€", digits = 0)
+```
+
+
+Distributions {data-icon="fa-area-chart"}
+===
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Price Distribution (€)
+```{r}
+fig <- plot_ly(df, x = ~PriceEuro, type = "histogram", nbinsx = 20,
+               marker = list(color = "#3ADAC6", line = list(color = "#fff", width = 0.5)),
+               hovertemplate = "€%{x:,.0f}<br>Count: %{y}<extra></extra>") %>%
+  layout(xaxis = list(title = "Price (€)", tickformat = ","),
+         yaxis = list(title = "Frequency"))
+fig
+```
+
+### Range Distribution (km)
+```{r}
+fig <- plot_ly(df, x = ~Range_Km, type = "histogram", nbinsx = 15,
+               marker = list(color = "#4ECDC4", line = list(color = "#fff", width = 0.5)),
+               hovertemplate = "%{x} km<br>Count: %{y}<extra></extra>") %>%
+  layout(xaxis = list(title = "Range (km)"),
+         yaxis = list(title = "Frequency"))
+fig
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Acceleration Distribution (0-100 km/h, seconds)
+```{r}
+fig <- plot_ly(df, x = ~AccelSec, type = "histogram", nbinsx = 15,
+               marker = list(color = "#FF6B6B", line = list(color = "#fff", width = 0.5)),
+               hovertemplate = "%{x}s<br>Count: %{y}<extra></extra>") %>%
+  layout(xaxis = list(title = "0-100 km/h (seconds)"),
+         yaxis = list(title = "Frequency"))
+fig
+```
+
+### Efficiency Distribution (Wh/km)
+```{r}
+fig <- plot_ly(df, x = ~Efficiency_WhKm, type = "histogram", nbinsx = 15,
+               marker = list(color = "#85bb65", line = list(color = "#fff", width = 0.5)),
+               hovertemplate = "%{x} Wh/km<br>Count: %{y}<extra></extra>") %>%
+  layout(xaxis = list(title = "Efficiency (Wh/km) — lower is better"),
+         yaxis = list(title = "Frequency"))
+fig
+```
+
+
+Data Quality {data-icon="fa-filter"}
+===
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Outlier Detection — IQR Method (1.5×IQR rule)
+```{r}
+DT::datatable(
+  outlier_df,
+  colnames = c("Feature", "Q1", "Q3", "IQR", "Lower Fence", "Upper Fence", "# Outliers"),
+  options = list(dom = "t", pageLength = 10),
+  fillContainer = FALSE
+)
+```
+
+### Outlier Visualisation — Box Plots with Outlier Points
+```{r fig.height=5}
+# Standardise for comparable box plots
+df_scaled_viz <- df %>%
+  select(all_of(outlier_cols)) %>%
+  tidyr::pivot_longer(everything(), names_to = "Feature", values_to = "Value")
+
+fig <- plot_ly(df_scaled_viz, x = ~Feature, y = ~Value, type = "box",
+               boxpoints = "outliers", jitter = 0.3, pointpos = -1.8,
+               marker = list(color = "#FF6B6B", size = 5),
+               line = list(color = "#3ADAC6"),
+               fillcolor = "rgba(58, 218, 198, 0.3)",
+               showlegend = FALSE,
+               hovertemplate = "<b>%{x}</b><br>Value: %{y:,.0f}<extra></extra>") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Value (original scale)"))
+fig
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Missing Values Summary
+```{r}
+miss_df <- data.frame(
+  Feature = names(df)[1:14],
+  Missing = sapply(df[, 1:14], function(x) sum(is.na(x))),
+  PctMissing = sapply(df[, 1:14], function(x) round(sum(is.na(x)) / length(x) * 100, 1)),
+  stringsAsFactors = FALSE
+)
+miss_df <- miss_df %>% arrange(desc(Missing))
+
+fig <- plot_ly(miss_df, x = ~reorder(Feature, -Missing), y = ~Missing, type = "bar",
+               marker = list(color = ifelse(miss_df$Missing > 0, "#FF6B6B", "#3ADAC6")),
+               text = ~paste0(Missing, " (", PctMissing, "%)"),
+               hovertemplate = "<b>%{x}</b><br>Missing: %{text}<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "Missing Count"),
+         margin = list(b = 100))
+fig
+```
+
+### Feature Scaling — Z-Score Normalisation (used for K-Means)
+```{r}
+scale_cols <- c("AccelSec", "TopSpeed_KmH", "Range_Km", "Efficiency_WhKm", "PriceEuro")
+df_z <- as.data.frame(scale(df[, scale_cols]))
+df_z_long <- tidyr::pivot_longer(df_z, everything(), names_to = "Feature", values_to = "ZScore")
+
+fig <- plot_ly(df_z_long, x = ~Feature, y = ~ZScore, type = "box",
+               color = ~Feature, showlegend = FALSE,
+               hovertemplate = "<b>%{x}</b><br>Z-score: %{y:.2f}<extra></extra>") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Z-Score (mean=0, sd=1)"),
+         title = list(text = "After standardisation — all features on comparable scale",
+                      y = 0.98, font = list(size = 11, color = "#888")))
+fig
+```
+
+
+Value Analysis {data-icon="fa-trophy"}
+===
+
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+### Best Value-for-Money — Range per €1,000 spent
+```{r}
+top_value <- df %>% arrange(desc(ValueIndex)) %>% head(20)
+
+fig <- plot_ly(top_value, x = ~reorder(FullName, ValueIndex), y = ~ValueIndex,
+               type = "bar", marker = list(color = ~ValueIndex, colorscale = "Viridis"),
+               text = ~paste("€", format(PriceEuro, big.mark=","), " | ", Range_Km, "km"),
+               hovertemplate = "<b>%{x}</b><br>Value: %{y} km/€1k<br>%{text}<extra></extra>")
+fig <- fig %>% layout(xaxis = list(title = "", tickangle = -45),
+                      yaxis = list(title = "Range (km) per €1,000"),
+                      margin = list(b = 120))
+fig
+```
+
+### Pareto Frontier — Range vs Price (Efficiency Frontier)
+```{r}
+# Cars on the Pareto frontier offer the best range at their price point
+df_sorted <- df %>% arrange(PriceEuro)
+pareto <- df_sorted[1, ]
+for (i in 2:nrow(df_sorted)) {
+  if (df_sorted$Range_Km[i] > max(pareto$Range_Km)) {
+    pareto <- rbind(pareto, df_sorted[i, ])
+  }
+}
+pareto <- pareto %>% arrange(PriceEuro)
+
+fig <- plot_ly() %>%
+  add_trace(data = df, x = ~PriceEuro, y = ~Range_Km, type = "scatter", mode = "markers",
+            marker = list(size = 8, opacity = 0.5, color = "#888"),
+            text = ~FullName, hovertemplate = "<b>%{text}</b><br>€%{x:,}<br>%{y} km<extra></extra>",
+            name = "All Cars") %>%
+  add_trace(data = pareto, x = ~PriceEuro, y = ~Range_Km, type = "scatter",
+            mode = "lines+markers",
+            line = list(color = "#3ADAC6", width = 3),
+            marker = list(size = 12, color = "#3ADAC6", symbol = "diamond"),
+            text = ~FullName, hovertemplate = "<b>%{text}</b><br>€%{x:,}<br>%{y} km<extra>Frontier</extra>",
+            name = "Pareto Frontier") %>%
+  layout(xaxis = list(title = "Price (€)", tickformat = ","),
+         yaxis = list(title = "Range (km)"),
+         legend = list(x = 0.05, y = 0.95))
+fig
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### Cost per km of Range — Lower is Better
+```{r}
+fig <- plot_ly(df, x = ~reorder(Brand, CostPerKm, FUN = median), y = ~CostPerKm,
+               type = "box", color = ~Brand, showlegend = FALSE,
+               text = ~Model,
+               hovertemplate = "<b>%{x}</b><br>%{text}<br>€%{y}/km<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "€ per km of Range"),
+         margin = list(b = 100))
+fig
+```
+
+### Value Index by Segment
+```{r}
+fig <- plot_ly(df, x = ~Segment, y = ~ValueIndex, type = "box",
+               color = ~Segment, showlegend = FALSE,
+               text = ~FullName,
+               hovertemplate = "<b>%{text}</b><br>Segment: %{x}<br>Value: %{y}<extra></extra>") %>%
+  layout(xaxis = list(title = "Segment"),
+         yaxis = list(title = "Value Index (km/€1k)"))
+fig
+```
+
+
+Brand Intelligence {data-icon="fa-bar-chart"}
+===
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Brand Benchmark — Average Metrics Comparison
+```{r}
+# Radar/polar chart comparing top brands across normalised dimensions
+top_brands <- brand_summary %>% filter(Models >= 2) %>% arrange(desc(Models)) %>% head(8)
+
+metrics <- c("AvgRange", "AvgSpeed", "AvgEfficiency", "AvgValue")
+labels  <- c("Range", "Top Speed", "Efficiency", "Value Index")
+
+# Normalise 0-1
+norm_data <- top_brands
+for (m in metrics) {
+  rng <- range(norm_data[[m]], na.rm = TRUE)
+  if (rng[2] - rng[1] > 0) {
+    norm_data[[m]] <- (norm_data[[m]] - rng[1]) / (rng[2] - rng[1])
+  } else {
+    norm_data[[m]] <- 0.5
+  }
+}
+# For efficiency, lower is better — invert
+norm_data$AvgEfficiency <- 1 - norm_data$AvgEfficiency
+
+fig <- plot_ly(type = "scatterpolar", fill = "toself")
+colors <- brewer.pal(nrow(top_brands), "Set2")
+for (i in seq_len(nrow(top_brands))) {
+  vals <- as.numeric(norm_data[i, metrics])
+  fig <- fig %>% add_trace(
+    r = c(vals, vals[1]),
+    theta = c(labels, labels[1]),
+    name = top_brands$Brand[i],
+    line = list(color = colors[i]),
+    fillcolor = paste0(colors[i], "33")
+  )
+}
+fig <- fig %>% layout(
+  polar = list(radialaxis = list(visible = TRUE, range = c(0, 1))),
+  legend = list(x = 1.05, y = 0.5)
+)
+fig
+```
+
+### Market Domination — Revenue Share by Brand
+```{r}
+brand_rev <- df %>% group_by(Brand) %>%
+  summarise(TotalRevenue = sum(PriceEuro), Models = n(), .groups = "drop") %>%
+  arrange(desc(TotalRevenue))
+
+fig <- plot_ly(brand_rev, labels = ~Brand, values = ~TotalRevenue, type = "pie",
+               textposition = "inside", textinfo = "label+percent",
+               insidetextfont = list(color = "#FFFFFF"),
+               marker = list(line = list(color = "#FFFFFF", width = 1)),
+               hovertemplate = "<b>%{label}</b><br>€%{value:,}<br>%{percent}<extra></extra>",
+               showlegend = FALSE) %>%
+  layout(title = list(text = "Market Share by Total Revenue (€)", y = 0.98))
+fig
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Brand Portfolio — Price Spread & Range
+```{r}
+fig <- plot_ly(df, x = ~Brand, y = ~PriceEuro, type = "box",
+               color = ~Brand, showlegend = FALSE,
+               text = ~Model,
+               hovertemplate = "<b>%{x} %{text}</b><br>€%{y:,}<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "Price (€)", tickformat = ","),
+         margin = list(b = 100))
+fig
+```
+
+### Brand Average — Price vs Range (bubble = # models)
+```{r}
+fig <- plot_ly(brand_summary, x = ~AvgPrice, y = ~AvgRange,
+               size = ~Models, sizes = c(20, 60),
+               type = "scatter", mode = "markers",
+               marker = list(sizemode = "diameter", opacity = 0.7),
+               color = ~Brand, showlegend = FALSE,
+               text = ~paste(Brand, "<br>Models:", Models),
+               hovertemplate = "<b>%{text}</b><br>Avg Price: €%{x:,.0f}<br>Avg Range: %{y:.0f} km<extra></extra>") %>%
+  layout(xaxis = list(title = "Average Price (€)", tickformat = ","),
+         yaxis = list(title = "Average Range (km)"))
+fig
+```
+
+
+Performance Lab {data-icon="fa-bolt"}
+===
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Acceleration vs Price — Are Expensive Cars Faster?
+```{r}
+fit <- lm(AccelSec ~ PriceEuro, data = df)
+
+fig <- plot_ly(df, x = ~PriceEuro, y = ~AccelSec, type = "scatter", mode = "markers",
+               color = ~PowerTrain,
+               text = ~FullName, size = ~TopSpeed_KmH, sizes = c(5, 25),
+               hovertemplate = "<b>%{text}</b><br>€%{x:,}<br>0-100: %{y}s<extra></extra>") %>%
+  add_trace(x = ~PriceEuro, y = fitted(fit), mode = "lines",
+            line = list(color = "red", dash = "dash", width = 2),
+            name = paste0("Trend (R²=", round(summary(fit)$r.squared, 3), ")"),
+            inherit = FALSE) %>%
+  layout(xaxis = list(title = "Price (€)", tickformat = ","),
+         yaxis = list(title = "0-100 km/h (seconds)", autorange = "reversed"),
+         legend = list(x = 0.7, y = 0.95))
+fig
+```
+
+### Speed vs Efficiency Trade-off
+```{r}
+fig <- plot_ly(df, x = ~TopSpeed_KmH, y = ~Efficiency_WhKm, type = "scatter", mode = "markers",
+               color = ~Segment, size = ~PriceEuro, sizes = c(5, 30),
+               text = ~FullName,
+               hovertemplate = "<b>%{text}</b><br>Speed: %{x} km/h<br>Efficiency: %{y} Wh/km<extra></extra>") %>%
+  layout(xaxis = list(title = "Top Speed (km/h)"),
+         yaxis = list(title = "Efficiency (Wh/km) — lower is better"))
+fig
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Drivetrain Performance Profile
+```{r}
+pt_stats <- df %>%
+  group_by(PowerTrain) %>%
+  summarise(
+    AvgAccel = mean(AccelSec),
+    AvgSpeed = mean(TopSpeed_KmH),
+    AvgRange = mean(Range_Km),
+    AvgEff   = mean(Efficiency_WhKm),
+    Count    = n(),
+    .groups = "drop"
+  )
+
+fig <- plot_ly() %>%
+  add_trace(data = pt_stats, x = ~PowerTrain, y = ~AvgAccel, type = "bar",
+            name = "Avg 0-100 (s)", marker = list(color = "#3ADAC6")) %>%
+  add_trace(data = pt_stats, x = ~PowerTrain, y = ~AvgSpeed / 30, type = "bar",
+            name = "Avg Speed (÷30)", marker = list(color = "#FF6B6B")) %>%
+  add_trace(data = pt_stats, x = ~PowerTrain, y = ~AvgRange / 50, type = "bar",
+            name = "Avg Range (÷50)", marker = list(color = "#4ECDC4")) %>%
+  layout(xaxis = list(title = "Drivetrain"),
+         yaxis = list(title = "Normalised Score"),
+         barmode = "group",
+         legend = list(x = 0.65, y = 0.95))
+fig
+```
+
+### Rapid Charging Impact on Price
+```{r}
+fig <- plot_ly(df, x = ~RapidCharge, y = ~PriceEuro, color = ~RapidCharge,
+               type = "box", boxpoints = "all", jitter = 0.3, pointpos = -1.8,
+               text = ~FullName,
+               hovertemplate = "<b>%{text}</b><br>€%{y:,}<extra></extra>") %>%
+  layout(xaxis = list(title = "Rapid Charge Capable?"),
+         yaxis = list(title = "Price (€)", tickformat = ","),
+         showlegend = FALSE)
+fig
+```
+
+
+Segment Deep-Dive {data-icon="fa-th-large"}
+===
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Segment Comparison — Key Metrics
+```{r}
+seg_stats <- df %>%
+  group_by(Segment) %>%
+  summarise(
+    Count     = n(),
+    AvgPrice  = mean(PriceEuro),
+    AvgRange  = mean(Range_Km),
+    AvgAccel  = mean(AccelSec),
+    AvgEff    = mean(Efficiency_WhKm),
+    .groups   = "drop"
+  ) %>%
+  arrange(AvgPrice)
+
+fig <- plot_ly(seg_stats, x = ~Segment, y = ~AvgPrice, type = "bar",
+               name = "Avg Price (€)", marker = list(color = "#3ADAC6"),
+               text = ~paste0("€", format(round(AvgPrice), big.mark = ",")),
+               textposition = "outside",
+               hovertemplate = "<b>Segment %{x}</b><br>Avg: €%{y:,.0f}<br>n=%{customdata}<extra></extra>",
+               customdata = ~Count) %>%
+  layout(xaxis = list(title = "Segment (A=Mini → F=Luxury, N=Commercial, S=Sport)"),
+         yaxis = list(title = "Average Price (€)", tickformat = ","))
+fig
+```
+
+### Body Style Distribution
+```{r}
+body_ct <- df %>% count(BodyStyle, Segment) %>% arrange(desc(n))
+
+fig <- plot_ly(body_ct, x = ~BodyStyle, y = ~n, color = ~Segment, type = "bar",
+               hovertemplate = "<b>%{x}</b><br>Segment: %{data.name}<br>Count: %{y}<extra></extra>") %>%
+  layout(xaxis = list(title = "Body Style"),
+         yaxis = list(title = "Number of Models"),
+         barmode = "stack")
+fig
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Segment — Range vs Efficiency
+```{r}
+fig <- plot_ly(df, x = ~Range_Km, y = ~Efficiency_WhKm, type = "scatter", mode = "markers",
+               color = ~Segment, symbol = ~BodyStyle,
+               size = ~PriceEuro, sizes = c(5, 25),
+               text = ~FullName,
+               hovertemplate = "<b>%{text}</b><br>Range: %{x} km<br>Eff: %{y} Wh/km<extra></extra>") %>%
+  layout(xaxis = list(title = "Range (km)"),
+         yaxis = list(title = "Efficiency (Wh/km)"))
+fig
+```
+
+### Plug Type & Charging Infrastructure
+```{r}
+plug_stats <- df %>%
+  group_by(PlugType) %>%
+  summarise(
+    Count    = n(),
+    AvgFastCharge = mean(FastCharge_KmH, na.rm = TRUE),
+    AvgPrice = mean(PriceEuro),
+    .groups  = "drop"
+  )
+
+fig <- plot_ly(plug_stats, x = ~PlugType, y = ~Count, type = "bar",
+               marker = list(color = ~AvgFastCharge, colorscale = "Viridis",
+                             showscale = TRUE, colorbar = list(title = "Avg Fast\nCharge\n(km/h)")),
+               text = ~paste("n =", Count, "\nAvg Charge:", round(AvgFastCharge), "km/h"),
+               hovertemplate = "<b>%{x}</b><br>Models: %{y}<br>Avg Fast Charge: %{marker.color:.0f} km/h<extra></extra>") %>%
+  layout(xaxis = list(title = "Plug Type"),
+         yaxis = list(title = "Number of Models"))
+fig
+```
+
+
+Clustering & Patterns {data-icon="fa-sitemap"}
+===
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### K-Means Clustering — Car Segments by Features
+```{r fig.height=6}
+# Cluster on numeric features
+cluster_vars <- df %>% select(AccelSec, TopSpeed_KmH, Range_Km, Efficiency_WhKm, PriceEuro)
+cluster_scaled <- scale(cluster_vars)
+rownames(cluster_scaled) <- df$FullName
+
+set.seed(42)
+km <- kmeans(cluster_scaled, centers = 4, nstart = 25)
+df$Cluster <- factor(km$cluster, labels = c("Budget Efficient", "Mid-Range", "Performance", "Ultra Premium"))
+
+# PCA for 2D viz
+pca <- prcomp(cluster_scaled)
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  Cluster = df$Cluster,
+  Name = df$FullName,
+  Price = df$PriceEuro
+)
+
+fig <- plot_ly(pca_df, x = ~PC1, y = ~PC2, type = "scatter", mode = "markers",
+               color = ~Cluster, size = ~Price, sizes = c(8, 30),
+               text = ~Name,
+               hovertemplate = "<b>%{text}</b><br>Cluster: %{data.name}<br>€%{marker.size:,}<extra></extra>") %>%
+  layout(xaxis = list(title = paste0("PC1 (", round(summary(pca)$importance[2,1]*100, 1), "% var)")),
+         yaxis = list(title = paste0("PC2 (", round(summary(pca)$importance[2,2]*100, 1), "% var)")),
+         title = list(text = "PCA Projection of K-Means Clusters", y = 0.98))
+fig
+```
+
+### Cluster Profiles — What Defines Each Group?
+```{r}
+cluster_profiles <- df %>%
+  group_by(Cluster) %>%
+  summarise(
+    Count   = n(),
+    AvgPrice  = round(mean(PriceEuro)),
+    AvgRange  = round(mean(Range_Km)),
+    AvgSpeed  = round(mean(TopSpeed_KmH)),
+    AvgAccel  = round(mean(AccelSec), 1),
+    AvgEff    = round(mean(Efficiency_WhKm)),
+    .groups = "drop"
+  )
+
+DT::datatable(cluster_profiles,
+  colnames = c("Cluster","Count","Avg Price (€)","Avg Range (km)",
+               "Avg Speed (km/h)","Avg 0-100 (s)","Avg Eff (Wh/km)"),
+  options = list(dom = "t", pageLength = 5),
+  fillContainer = FALSE
+) %>% DT::formatCurrency("AvgPrice", currency = "€", digits = 0)
+```
+
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Correlation Matrix — All Numeric Features
+```{r fig.height=5}
+num_cols <- df %>% select(AccelSec, TopSpeed_KmH, Range_Km, Efficiency_WhKm,
+                          FastCharge_KmH, PriceEuro, Seats, ValueIndex, CostPerKm)
+cor_mat <- cor(num_cols, use = "pairwise.complete.obs")
+
+fig <- plot_ly(
+  x = colnames(cor_mat), y = colnames(cor_mat), z = round(cor_mat, 3),
+  type = "heatmap", colorscale = "RdBu", zmid = 0,
+  text = round(cor_mat, 2), texttemplate = "%{text}",
+  hovertemplate = "<b>%{x} vs %{y}</b><br>r = %{z:.3f}<extra></extra>"
+) %>%
+  layout(xaxis = list(tickangle = -45),
+         margin = list(b = 100, l = 100))
+fig
+```
+
+### Key Insight — What Drives Price? (Linear Regression Coefficients)
+```{r}
+model <- lm(PriceEuro ~ AccelSec + TopSpeed_KmH + Range_Km + Efficiency_WhKm + Seats, data = df)
+coefs <- summary(model)$coefficients[-1, ]  # drop intercept
+coef_df <- data.frame(
+  Feature = rownames(coefs),
+  Estimate = coefs[, 1],
+  StdErr   = coefs[, 2],
+  Pvalue   = coefs[, 4]
+)
+coef_df$Significant <- ifelse(coef_df$Pvalue < 0.05, "p < 0.05", "Not Sig.")
+coef_df$Feature <- c("Acceleration (s)", "Top Speed", "Range (km)", "Efficiency (Wh/km)", "Seats")
+
+fig <- plot_ly(coef_df, x = ~Feature, y = ~Estimate, type = "bar",
+               color = ~Significant,
+               colors = c("p < 0.05" = "#3ADAC6", "Not Sig." = "#CCCCCC"),
+               error_y = list(type = "data", array = ~StdErr * 1.96, color = "#666"),
+               hovertemplate = "<b>%{x}</b><br>Coef: €%{y:,.0f}<br>±%{error_y.array:,.0f}<extra></extra>") %>%
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Effect on Price (€)", tickformat = ","),
+         title = list(text = paste0("R² = ", round(summary(model)$r.squared, 3)), y = 0.98))
+fig
+```
+
+
+Feature Comparison {data-icon="fa-car"}
+===
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Fastest Charging (km/h gained per hour of charge)
+```{r}
+df_charge <- df %>% filter(!is.na(FastCharge_KmH)) %>% arrange(desc(FastCharge_KmH)) %>% head(25)
+
+fig <- plot_ly(df_charge, x = ~reorder(FullName, FastCharge_KmH), y = ~FastCharge_KmH,
+               type = "bar", marker = list(color = ~FastCharge_KmH, colorscale = "Plasma"),
+               hovertemplate = "<b>%{x}</b><br>%{y} km/h<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "Fast Charge (km/h)"),
+         margin = list(b = 150))
+fig
+```
+
+### Quickest Acceleration (0-100 km/h)
+```{r}
+df_accel <- df %>% arrange(AccelSec) %>% head(20)
+
+fig <- plot_ly(df_accel, x = ~reorder(FullName, -AccelSec), y = ~AccelSec,
+               type = "bar",
+               marker = list(color = ~AccelSec, colorscale = list(c(0,1), c("#3ADAC6","#FF6B6B")),
+                             reversescale = TRUE),
+               hovertemplate = "<b>%{x}</b><br>%{y}s<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "Seconds (0-100 km/h)"),
+         margin = list(b = 150))
+fig
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Range Champions
+```{r}
+df_range <- df %>% arrange(desc(Range_Km)) %>% head(20)
+
+fig <- plot_ly(df_range, x = ~reorder(FullName, Range_Km), y = ~Range_Km,
+               type = "bar", marker = list(color = ~Range_Km, colorscale = "Viridis"),
+               text = ~paste("€", format(PriceEuro, big.mark = ",")),
+               hovertemplate = "<b>%{x}</b><br>%{y} km<br>%{text}<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "Range (km)"),
+         margin = list(b = 150))
+fig
+```
+
+### Speed Kings
+```{r}
+df_speed <- df %>% arrange(desc(TopSpeed_KmH)) %>% head(20)
+
+fig <- plot_ly(df_speed, x = ~reorder(FullName, TopSpeed_KmH), y = ~TopSpeed_KmH,
+               type = "bar", marker = list(color = ~TopSpeed_KmH, colorscale = "Inferno"),
+               hovertemplate = "<b>%{x}</b><br>%{y} km/h<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "Top Speed (km/h)"),
+         margin = list(b = 150))
+fig
+```
+
+
+Market Intelligence {data-icon="fa-lightbulb"}
+===
+
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+### Overpriced or Hidden Gem? (Fair Price from Specs vs Actual)
+```{r}
+price_range <- range(c(df$FairPrice, df$PriceEuro))
+
+fig <- plot_ly() %>%
+  add_trace(data = df, x = ~FairPrice, y = ~PriceEuro, type = "scatter", mode = "markers",
+            color = ~Brand, size = ~abs(PriceDelta), sizes = c(6, 25),
+            text = ~paste0("<b>", FullName, "</b>",
+                           "<br>Actual: \u20AC", format(PriceEuro, big.mark = ","),
+                           "<br>Fair Price: \u20AC", format(FairPrice, big.mark = ","),
+                           "<br>", ifelse(PriceDelta > 0,
+                                          paste0("Overpriced by \u20AC", format(abs(PriceDelta), big.mark = ","),
+                                                 " (+", PriceDeltaPct, "%)"),
+                                          paste0("Hidden gem — saves \u20AC", format(abs(PriceDelta), big.mark = ","),
+                                                 " (", PriceDeltaPct, "%)"))),
+            hovertemplate = "%{text}<extra></extra>",
+            showlegend = FALSE) %>%
+  add_trace(x = price_range, y = price_range, type = "scatter", mode = "lines",
+            line = list(color = "red", dash = "dash", width = 2),
+            name = "Fair Value Line", showlegend = TRUE, inherit = FALSE) %>%
+  add_annotations(x = price_range[1] + 5000, y = price_range[2] - 10000,
+                  text = "\u2191 OVERPRICED\n(paying for brand)", showarrow = FALSE,
+                  font = list(color = "#FF6B6B", size = 12)) %>%
+  add_annotations(x = price_range[2] - 20000, y = price_range[1] + 10000,
+                  text = "\u2193 HIDDEN GEMS\n(great specs, low price)", showarrow = FALSE,
+                  font = list(color = "#3ADAC6", size = 12)) %>%
+  layout(xaxis = list(title = "Predicted Fair Price (\u20AC)", tickformat = ","),
+         yaxis = list(title = "Actual Price (\u20AC)", tickformat = ","),
+         title = list(text = paste0("Hedonic Price Model (R\u00B2 = ",
+                                     round(summary(fair_model)$r.squared, 3), ")"), y = 0.98))
+fig
+```
+
+### 5-Year Total Cost of Ownership (Purchase + Electricity)
+```{r}
+tco_top <- df %>% arrange(TCO5yr) %>% head(20)
+
+fig <- plot_ly() %>%
+  add_trace(data = tco_top, y = ~reorder(FullName, -TCO5yr), x = ~PriceEuro,
+            type = "bar", orientation = "h", name = "Purchase Price",
+            marker = list(color = "#3ADAC6"),
+            text = ~paste0("\u20AC", format(PriceEuro, big.mark = ",")),
+            hovertemplate = "<b>%{y}</b><br>Purchase: %{text}<extra></extra>") %>%
+  add_trace(data = tco_top, y = ~reorder(FullName, -TCO5yr), x = ~ElecCost5yr,
+            type = "bar", orientation = "h", name = "5yr Electricity",
+            marker = list(color = "#FF6B6B"),
+            text = ~paste0("\u20AC", format(ElecCost5yr, big.mark = ",")),
+            hovertemplate = "<b>%{y}</b><br>Electricity (5yr): %{text}<extra></extra>") %>%
+  layout(barmode = "stack",
+         xaxis = list(title = "Total Cost (\u20AC)", tickformat = ","),
+         yaxis = list(title = ""),
+         legend = list(x = 0.7, y = 0.1),
+         margin = list(l = 180),
+         title = list(text = "Assumes 15,000 km/yr, \u20AC0.25/kWh", y = 0.98,
+                      font = list(size = 12, color = "#888")))
+fig
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### Best Car For You (TOPSIS Multi-Criteria Recommender)
+```{r}
+DT::datatable(
+  topsis_all,
+  colnames = c("Buyer Profile", "#", "Car", "Score", "Price (\u20AC)", "Range (km)"),
+  options = list(
+    dom = "t",
+    pageLength = 20,
+    columnDefs = list(list(className = "dt-center", targets = c(1, 3, 4, 5))),
+    rowCallback = DT::JS(
+      "function(row, data, index) {",
+      "  var profile = data[0];",
+      "  var colors = {'Budget Commuter':'#3ADAC6','Road Trip Ready':'#4ECDC4',",
+      "                'Performance Enthusiast':'#FF6B6B','Green Minimalist':'#85bb65'};",
+      "  $('td:eq(0)', row).css('background-color', colors[profile] || '#fff');",
+      "  $('td:eq(0)', row).css('color', '#fff');",
+      "  $('td:eq(0)', row).css('font-weight', 'bold');",
+      "}"
+    )
+  ),
+  rownames = FALSE,
+  fillContainer = FALSE
+) %>%
+  DT::formatCurrency("Price", currency = "\u20AC", digits = 0) %>%
+  DT::formatRound("Score", digits = 3)
+```
+
+### Market Gaps — Where Are the Opportunities?
+```{r}
+gap_matrix <- table(df$PriceTier, df$RangeTier)
+gap_df <- as.data.frame.matrix(gap_matrix)
+
+fig <- plot_ly(
+  x = colnames(gap_df),
+  y = rownames(gap_df),
+  z = as.matrix(gap_df),
+  type = "heatmap",
+  colorscale = list(
+    list(0, "#2d0a3e"),
+    list(0.01, "#2d0a3e"),
+    list(0.5, "#3ADAC6"),
+    list(1, "#85bb65")
+  ),
+  text = matrix(
+    paste0(as.matrix(gap_df), ifelse(as.matrix(gap_df) == 0, " \u2014 OPPORTUNITY!", " models")),
+    nrow = nrow(gap_df)
+  ),
+  texttemplate = "%{text}",
+  hovertemplate = "<b>%{y} \u00D7 %{x}</b><br>%{z} models<extra></extra>",
+  showscale = FALSE
+) %>%
+  layout(
+    xaxis = list(title = "Range Tier"),
+    yaxis = list(title = "Price Tier"),
+    title = list(text = "0 = No car exists in this space", y = 0.98,
+                 font = list(size = 11, color = "#888"))
+  )
+fig
+```
+
+
+ML Lab — Classification {data-icon="fa-brain"}
+===
+
+Row
+-----------------------------------------------------------------------
+
+### Train Accuracy
+```{r}
+valueBox(paste0(dt_train_acc, "%"), icon = "fa-check", color = "#3ADAC6")
+```
+
+### Test Accuracy
+```{r}
+valueBox(paste0(dt_test_acc, "%"), icon = "fa-bullseye", color = ifelse(dt_test_acc >= 50, "#4ECDC4", "#FF6B6B"))
+```
+
+### Baseline (Majority Class)
+```{r}
+valueBox(paste0(dt_baseline_acc, "% (", majority_class, ")"), icon = "fa-balance-scale", color = "#888")
+```
+
+### Train/Test Split
+```{r}
+valueBox(paste0(nrow(train_df), " / ", nrow(test_df)), icon = "fa-random", color = "#85bb65")
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Confusion Matrix — Test Set (Predicted vs Actual)
+```{r}
+conf_mat <- dt_conf_full
+fig <- plot_ly(
+  x = colnames(conf_mat), y = rownames(conf_mat), z = conf_mat,
+  type = "heatmap", colorscale = list(list(0, "#1a1a2e"), list(1, "#3ADAC6")),
+  text = conf_mat, texttemplate = "%{text}",
+  hovertemplate = "<b>Predicted: %{y}<br>Actual: %{x}</b><br>Count: %{z}<extra></extra>",
+  showscale = FALSE
+) %>%
+  layout(xaxis = list(title = "Actual Segment", dtick = 1),
+         yaxis = list(title = "Predicted Segment", autorange = "reversed", dtick = 1))
+fig
+```
+
+### Per-Class Metrics — Precision, Recall, F1
+```{r}
+DT::datatable(
+  dt_metrics,
+  colnames = c("Segment", "Precision", "Recall", "F1 Score"),
+  options = list(dom = "t", pageLength = 10),
+  fillContainer = FALSE
+) %>%
+  DT::formatRound(c("Precision", "Recall", "F1"), digits = 3)
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Decision Tree Split Rules
+```{r}
+# Extract readable rules from the tree
+frame <- dt_model$frame
+splits <- frame[frame$var != "<leaf>", ]
+rule_df <- data.frame(
+  Node = rownames(splits),
+  SplitVar = as.character(splits$var),
+  N = splits$n,
+  Complexity = round(splits$complexity, 4),
+  stringsAsFactors = FALSE
+)
+
+DT::datatable(
+  rule_df,
+  colnames = c("Node", "Split Variable", "Samples", "Complexity (cp)"),
+  options = list(dom = "t", pageLength = 15),
+  fillContainer = FALSE
+)
+```
+
+### Classification — Predicted Segment Distribution (Test Set)
+```{r}
+pred_dist <- as.data.frame(table(test_df$PredSegment))
+actual_dist <- as.data.frame(table(test_df$Segment))
+names(pred_dist) <- c("Segment", "Predicted")
+names(actual_dist) <- c("Segment", "Actual")
+dist_cmp <- merge(actual_dist, pred_dist, by = "Segment", all = TRUE)
+dist_cmp[is.na(dist_cmp)] <- 0
+
+fig <- plot_ly(dist_cmp, x = ~Segment) %>%
+  add_trace(y = ~Actual, type = "bar", name = "Actual", marker = list(color = "#3ADAC6")) %>%
+  add_trace(y = ~Predicted, type = "bar", name = "Predicted", marker = list(color = "#FF6B6B")) %>%
+  layout(barmode = "group",
+         xaxis = list(title = "Segment"),
+         yaxis = list(title = "Count"),
+         legend = list(x = 0.8, y = 0.95))
+fig
+```
+
+
+ML Lab — Regression {data-icon="fa-line-chart"}
+===
+
+Row
+-----------------------------------------------------------------------
+
+### RF Test R²
+```{r}
+valueBox(rf_test_r2, icon = "fa-tree", color = "#3ADAC6")
+```
+
+### LM Test R²
+```{r}
+valueBox(lm_test_r2, icon = "fa-line-chart", color = "#4ECDC4")
+```
+
+### RF RMSE (€)
+```{r}
+valueBox(paste0("€", format(rf_test_rmse, big.mark = ",")), icon = "fa-exclamation-triangle",
+         color = ifelse(rf_test_rmse < baseline_rmse, "#3ADAC6", "#FF6B6B"))
+```
+
+### Baseline RMSE (€)
+```{r}
+valueBox(paste0("€", format(baseline_rmse, big.mark = ",")), icon = "fa-balance-scale", color = "#888")
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Price Prediction — RF vs LM (Test Set)
+```{r}
+price_range_ml <- range(c(test_df$PriceEuro, test_df$RF_Price, test_df$LM_Price))
+
+fig <- plot_ly() %>%
+  add_trace(data = test_df, x = ~PriceEuro, y = ~LM_Price, type = "scatter", mode = "markers",
+            marker = list(size = 10, opacity = 0.7, color = "#FF6B6B", symbol = "circle"),
+            text = ~FullName,
+            hovertemplate = "<b>%{text}</b><br>Actual: €%{x:,}<br>LM: €%{y:,}<extra></extra>",
+            name = paste0("Linear Regression (R²=", lm_test_r2, ")")) %>%
+  add_trace(data = test_df, x = ~PriceEuro, y = ~RF_Price, type = "scatter", mode = "markers",
+            marker = list(size = 10, opacity = 0.7, color = "#3ADAC6", symbol = "diamond"),
+            text = ~FullName,
+            hovertemplate = "<b>%{text}</b><br>Actual: €%{x:,}<br>RF: €%{y:,}<extra></extra>",
+            name = paste0("Random Forest (R²=", rf_test_r2, ")")) %>%
+  add_trace(x = price_range_ml, y = price_range_ml, type = "scatter", mode = "lines",
+            line = list(color = "#888", dash = "dash", width = 2),
+            name = "Perfect Prediction", inherit = FALSE) %>%
+  layout(xaxis = list(title = "Actual Price (€)", tickformat = ","),
+         yaxis = list(title = "Predicted Price (€)", tickformat = ","),
+         legend = list(x = 0.02, y = 0.98))
+fig
+```
+
+### Model Comparison Table
+```{r}
+model_cmp <- data.frame(
+  Model = c("Random Forest", "Linear Regression", "Baseline (Mean)"),
+  Train_R2 = c(rf_train_r2, lm_train_r2, 0),
+  Test_R2 = c(rf_test_r2, lm_test_r2, 0),
+  Test_RMSE = c(rf_test_rmse, lm_test_rmse, baseline_rmse),
+  Test_MAE = c(rf_test_mae, lm_test_mae, baseline_mae),
+  stringsAsFactors = FALSE
+)
+
+DT::datatable(
+  model_cmp,
+  colnames = c("Model", "Train R²", "Test R²", "Test RMSE (€)", "Test MAE (€)"),
+  options = list(dom = "t", pageLength = 5),
+  fillContainer = FALSE
+) %>%
+  DT::formatCurrency(c("Test_RMSE", "Test_MAE"), currency = "€", digits = 0) %>%
+  DT::formatRound(c("Train_R2", "Test_R2"), digits = 3)
+```
+
+Column {data-width=500}
+-----------------------------------------------------------------------
+
+### Random Forest — Feature Importance
+```{r}
+fig <- plot_ly(rf_imp, x = ~reorder(Feature, Importance), y = ~Importance,
+               type = "bar",
+               marker = list(color = ~Importance, colorscale = "Viridis"),
+               hovertemplate = "<b>%{x}</b><br>Importance: %{y:.1f}%<extra></extra>") %>%
+  layout(xaxis = list(title = "", tickangle = -35),
+         yaxis = list(title = "% Increase in MSE when Removed"),
+         margin = list(b = 100))
+fig
+```
+
+### Residual Analysis — RF Prediction Errors (Test Set)
+```{r}
+test_df$RF_Residual <- test_df$PriceEuro - test_df$RF_Price
+
+fig <- plot_ly(test_df, x = ~RF_Price, y = ~RF_Residual, type = "scatter", mode = "markers",
+               marker = list(size = 10, color = ~abs(RF_Residual), colorscale = "RdBu",
+                             showscale = TRUE, colorbar = list(title = "Error (€)")),
+               text = ~FullName,
+               hovertemplate = "<b>%{text}</b><br>Predicted: €%{x:,}<br>Error: €%{y:,}<extra></extra>") %>%
+  add_trace(x = range(test_df$RF_Price), y = c(0, 0), type = "scatter", mode = "lines",
+            line = list(color = "red", dash = "dash", width = 2),
+            name = "Zero Error", inherit = FALSE, showlegend = FALSE) %>%
+  layout(xaxis = list(title = "Predicted Price (€)", tickformat = ","),
+         yaxis = list(title = "Residual = Actual - Predicted (€)", tickformat = ","),
+         showlegend = FALSE)
+fig
+```

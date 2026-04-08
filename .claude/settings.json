@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(R --version)",
+      "Bash(Rscript --version)",
+      "Bash(Rscript -e 'installed <- installed.packages\\(\\)[,\"Package\"]; needed <- c\\(\"flexdashboard\",\"rmarkdown\",\"plotly\",\"DT\",\"thematic\",\"bslib\",\"shiny\",\"dplyr\",\"tidyr\",\"ggplot2\",\"corrplot\",\"treemap\",\"cluster\",\"factoextra\",\"scales\",\"RColorBrewer\",\"ggridges\",\"GGally\",\"reshape2\"\\); cat\\(\"Installed:\", paste\\(needed[needed %in% installed], collapse=\", \"\\), \"\\\\n\"\\); cat\\(\"Missing:\", paste\\(needed[!needed %in% installed], collapse=\", \"\\), \"\\\\n\"\\)')",
+      "Bash(Rscript -e 'install.packages\\(c\\(\"flexdashboard\",\"DT\",\"thematic\",\"shiny\",\"corrplot\",\"treemap\",\"factoextra\",\"ggridges\",\"GGally\",\"reshape2\"\\), repos=\"https://cloud.r-project.org\", quiet=TRUE\\)')",
+      "Bash(Rscript -e 'needed <- c\\(\"flexdashboard\",\"DT\",\"thematic\",\"shiny\",\"corrplot\",\"treemap\",\"factoextra\",\"ggridges\",\"GGally\",\"reshape2\"\\); installed <- installed.packages\\(\\)[,\"Package\"]; cat\\(\"Missing:\", paste\\(needed[!needed %in% installed], collapse=\", \"\\), \"\\\\n\"\\)')",
+      "Bash(Rscript render.R)",
+      "Bash(pandoc --version)",
+      "Bash(Rscript -e \"install.packages\\(c\\('rpart.plot', 'randomForest'\\), repos='https://cran.r-project.org', quiet=TRUE\\)\")",
+      "Read(//private/tmp/**)",
+      "Bash(python3 -c ':*)",
+      "Bash(python3 generate_report.py)"
+    ]
+  }
+}
